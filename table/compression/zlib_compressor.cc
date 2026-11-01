@@ -5,9 +5,67 @@
 #include <algorithm>
 #include <zlib.h>
 
+#if HAVE_LIBDEFLATE
+#include <memory>
+
+#include <libdeflate.h>
+#endif
+
 #include "table/compression/zlib_compressor.h"
 
 namespace leveldb {
+
+#if HAVE_LIBDEFLATE
+namespace {
+
+struct DecompressorDeleter {
+  void operator()(libdeflate_decompressor* decompressor) const {
+    libdeflate_free_decompressor(decompressor);
+  }
+};
+
+// A decompressor isn't thread-safe, and compactions read on their own thread.
+thread_local std::unique_ptr<libdeflate_decompressor, DecompressorDeleter>
+    decompressor;
+
+// Bounds what a corrupt or hostile block can make us allocate.
+constexpr size_t kMaxInflatedSize = size_t{256} << 20;
+
+// Inflates into output, appending like inflate() does. Returns false if
+// libdeflate can't decode the block, so the caller can let zlib try.
+bool InflateWithLibdeflate(bool raw, const char* input, size_t length,
+                           ::std::string& output) {
+  if (!decompressor) {
+    decompressor.reset(libdeflate_alloc_decompressor());
+    if (!decompressor) {
+      return false;
+    }
+  }
+  const size_t start = output.size();
+  size_t capacity = std::max<size_t>(length * 4, 64 * 1024);
+  while (true) {
+    output.resize(start + capacity);
+    size_t actual = 0;
+    const libdeflate_result result =
+        raw ? libdeflate_deflate_decompress(decompressor.get(), input, length,
+                                            &output[start], capacity, &actual)
+            : libdeflate_zlib_decompress(decompressor.get(), input, length,
+                                         &output[start], capacity, &actual);
+    if (result == LIBDEFLATE_SUCCESS) {
+      output.resize(start + actual);
+      return true;
+    }
+    if (result != LIBDEFLATE_INSUFFICIENT_SPACE ||
+        capacity >= kMaxInflatedSize) {
+      output.resize(start);
+      return false;
+    }
+    capacity = std::min(capacity * 2, kMaxInflatedSize);
+  }
+}
+
+}  // namespace
+#endif
 
 void ZlibCompressorBase::compress(const char* input, size_t length,
                                       ::std::string& buffer) const {
@@ -90,6 +148,12 @@ int ZlibCompressorBase::inflate(const char* input, size_t length,
 
 bool ZlibCompressorBase::decompress(const char* input, size_t length,
                                     ::std::string& output) const {
+#if HAVE_LIBDEFLATE
+  // the same blocks, read about twice as fast
+  if (InflateWithLibdeflate(raw, input, length, output)) {
+    return true;
+  }
+#endif
   return inflate(input, length, output) == Z_OK;
 }
 
